@@ -1,9 +1,11 @@
 use actix_web::{error, post, web, App, Error, HttpResponse, HttpServer};
 use futures_util::StreamExt;
 use std::env;
+use webhook::Webhook;
 
 struct GlobalState {
     request_secret: String,
+    webhook_url: String,
 }
 
 async fn extract_capped_body_string(mut payload: web::Payload) -> Result<String, Error> {
@@ -25,6 +27,20 @@ async fn extract_capped_body_string(mut payload: web::Payload) -> Result<String,
     }
 }
 
+async fn send_webhook(webhook_url: String) -> Result<(), Box<dyn std::error::Error>> {
+    Webhook::from_url(webhook_url.as_str())
+        .send(|message| {
+            message
+                .username("Intercom notifier")
+                .avatar_url("https://github.com/kory33/home-intercom-server-rs/raw/master/assets/240px-Speaker_Icon.jpg")
+                .content("@everyone")
+                .embed(|embed| {
+                    embed.title("The intercom just rang!")
+                })
+        })
+        .await
+}
+
 #[post("/")]
 async fn handle_request(
     data: web::Data<GlobalState>,
@@ -32,7 +48,10 @@ async fn handle_request(
 ) -> Result<HttpResponse, Error> {
     if data.request_secret == extract_capped_body_string(payload).await? {
         // we admit that the request is valid
-        Ok(HttpResponse::Ok().finish())
+        match send_webhook(data.webhook_url.clone()).await {
+            Ok(_) => Ok(HttpResponse::Ok().finish()),
+            Err(_) => Ok(HttpResponse::BadGateway().finish()),
+        }
     } else {
         // request body did not equal the request secret
         Ok(HttpResponse::Unauthorized().finish())
@@ -41,12 +60,14 @@ async fn handle_request(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let webhook_url = env::var("INTERCOM_DISCORD_WEBHOOK_URL").expect("webhook url");
     let request_secret = env::var("INTERCOM_REQUEST_SECRET").expect("request secret");
 
     HttpServer::new(move || {
         App::new()
             .data(GlobalState {
                 request_secret: request_secret.clone(),
+                webhook_url: webhook_url.clone(),
             })
             .service(handle_request)
     })
