@@ -1,4 +1,4 @@
-use actix_web::{error, post, web, App, Error, HttpResponse, HttpServer};
+use actix_web::{error, get, post, web, App, Error, HttpResponse, HttpServer, Responder};
 use futures_util::StreamExt;
 use std::env;
 use webhook::Webhook;
@@ -41,8 +41,13 @@ async fn send_webhook(webhook_url: String) -> Result<(), Box<dyn std::error::Err
         .await
 }
 
+#[get("/")]
+async fn handle_get_request() -> impl Responder {
+    HttpResponse::NoContent()
+}
+
 #[post("/")]
-async fn handle_request(
+async fn handle_post_request(
     data: web::Data<GlobalState>,
     payload: web::Payload,
 ) -> Result<HttpResponse, Error> {
@@ -69,7 +74,8 @@ async fn main() -> std::io::Result<()> {
                 request_secret: request_secret.clone(),
                 webhook_url: webhook_url.clone(),
             })
-            .service(handle_request)
+            .service(handle_get_request)
+            .service(handle_post_request)
     })
     .bind("0.0.0.0:8080")?
     .run()
