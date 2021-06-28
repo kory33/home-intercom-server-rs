@@ -1,30 +1,12 @@
-use actix_web::{error, get, post, web, App, Error, HttpResponse, HttpServer, Responder};
-use futures_util::StreamExt;
+use actix_web::dev::ServiceRequest;
+use actix_web::{error, post, web, App, HttpResponse, HttpServer};
+use actix_web_httpauth::extractors::bearer::BearerAuth;
+use actix_web_httpauth::middleware::HttpAuthentication;
 use std::env;
 use webhook::Webhook;
 
 struct GlobalState {
-    request_secret: String,
     webhook_url: String,
-}
-
-async fn extract_capped_body_string(mut payload: web::Payload) -> Result<String, Error> {
-    // max payload size is 256
-    const MAX_BODY_SIZE: usize = 256;
-
-    let mut body = web::BytesMut::new();
-    while let Some(chunk) = payload.next().await {
-        let chunk = chunk?;
-        if (body.len() + chunk.len()) > MAX_BODY_SIZE {
-            return Err(error::ErrorBadRequest("request too large"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    match String::from_utf8(body.to_vec()) {
-        Ok(s) => Ok(s),
-        Err(_) => Err(error::ErrorBadRequest("body not recognized")),
-    }
 }
 
 async fn send_webhook(webhook_url: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -41,25 +23,18 @@ async fn send_webhook(webhook_url: String) -> Result<(), Box<dyn std::error::Err
         .await
 }
 
-#[get("/")]
-async fn handle_get_request() -> impl Responder {
-    HttpResponse::NoContent()
+#[post("/ping")]
+async fn handle_ping(data: web::Data<GlobalState>) -> Result<HttpResponse, actix_web::Error> {
+    // TODO increment counter
+    Ok(HttpResponse::Ok().finish())
 }
 
-#[post("/")]
-async fn handle_post_request(
-    data: web::Data<GlobalState>,
-    payload: web::Payload,
-) -> Result<HttpResponse, Error> {
-    if data.request_secret == extract_capped_body_string(payload).await? {
-        // we admit that the request is valid
-        match send_webhook(data.webhook_url.clone()).await {
-            Ok(_) => Ok(HttpResponse::Ok().finish()),
-            Err(_) => Ok(HttpResponse::BadGateway().finish()),
-        }
-    } else {
-        // request body did not equal the request secret
-        Ok(HttpResponse::Unauthorized().finish())
+#[post("/notify")]
+async fn handle_notify(data: web::Data<GlobalState>) -> Result<HttpResponse, actix_web::Error> {
+    // we admit that the request is valid
+    match send_webhook(data.webhook_url.clone()).await {
+        Ok(_) => Ok(HttpResponse::Ok().finish()),
+        Err(_) => Ok(HttpResponse::BadGateway().finish()),
     }
 }
 
@@ -69,13 +44,28 @@ async fn main() -> std::io::Result<()> {
     let request_secret = env::var("INTERCOM_REQUEST_SECRET").expect("request secret");
 
     HttpServer::new(move || {
+        let request_secret = request_secret.clone();
+
+        let state = GlobalState {
+            webhook_url: webhook_url.clone(),
+        };
+
+        let validate_credentials = move |req: ServiceRequest, credentials: BearerAuth| {
+            let valid = credentials.token() == request_secret;
+            async move {
+                if valid {
+                    Ok(req)
+                } else {
+                    Err(error::ErrorUnauthorized(""))
+                }
+            }
+        };
+
         App::new()
-            .data(GlobalState {
-                request_secret: request_secret.clone(),
-                webhook_url: webhook_url.clone(),
-            })
-            .service(handle_get_request)
-            .service(handle_post_request)
+            .wrap(HttpAuthentication::bearer(validate_credentials))
+            .data(state)
+            .service(handle_ping)
+            .service(handle_notify)
     })
     .bind("0.0.0.0:8080")?
     .run()
