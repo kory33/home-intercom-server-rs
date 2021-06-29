@@ -2,10 +2,13 @@ use actix_web::dev::ServiceRequest;
 use actix_web::{error, post, web, App, HttpResponse, HttpServer};
 use actix_web_httpauth::extractors::bearer::BearerAuth;
 use actix_web_httpauth::middleware::HttpAuthentication;
+use actix_web_prom::PrometheusMetrics;
+use prometheus::{opts, IntCounterVec};
 use std::env;
 use webhook::Webhook;
 
-struct GlobalState {
+// Application-wide configuration for Discord webhook url
+struct WebhookURLConfig {
     webhook_url: String,
 }
 
@@ -24,13 +27,17 @@ async fn send_webhook(webhook_url: String) -> Result<(), Box<dyn std::error::Err
 }
 
 #[post("/ping")]
-async fn handle_ping(data: web::Data<GlobalState>) -> Result<HttpResponse, actix_web::Error> {
-    // TODO increment counter
-    Ok(HttpResponse::Ok().finish())
+async fn handle_ping(data: web::Data<IntCounterVec>) -> HttpResponse {
+    // increment count with dummy_label=""
+    data.with_label_values(&[""]).inc();
+
+    HttpResponse::Ok().finish()
 }
 
 #[post("/notify")]
-async fn handle_notify(data: web::Data<GlobalState>) -> Result<HttpResponse, actix_web::Error> {
+async fn handle_notify(
+    data: web::Data<WebhookURLConfig>,
+) -> Result<HttpResponse, actix_web::Error> {
     // we admit that the request is valid
     match send_webhook(data.webhook_url.clone()).await {
         Ok(_) => Ok(HttpResponse::Ok().finish()),
@@ -40,34 +47,53 @@ async fn handle_notify(data: web::Data<GlobalState>) -> Result<HttpResponse, act
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let webhook_url = env::var("INTERCOM_DISCORD_WEBHOOK_URL").expect("webhook url");
-    let request_secret = env::var("INTERCOM_REQUEST_SECRET").expect("request secret");
+    // we do not care the value of the label, so put "dummy_label" as the only label
+    let ping_count = IntCounterVec::new(
+        opts!("ping_count", "count of valid requests to /ping").namespace("home_intercom_server"),
+        &["dummy_label"],
+    )
+    .unwrap();
 
-    HttpServer::new(move || {
-        let request_secret = request_secret.clone();
+    let metrics_server = {
+        let ping_count = ping_count.clone();
+        let prometheus = PrometheusMetrics::new("home_intercom_server", Some("/metrics"), None);
+        prometheus.registry.register(Box::new(ping_count)).unwrap();
 
-        let state = GlobalState {
-            webhook_url: webhook_url.clone(),
-        };
+        HttpServer::new(move || App::new().wrap(prometheus.clone()))
+            .bind("0.0.0.0:8081")?
+            .run()
+    };
 
-        let validate_credentials = move |req: ServiceRequest, credentials: BearerAuth| {
-            let valid = credentials.token() == request_secret;
-            async move {
-                if valid {
-                    Ok(req)
-                } else {
-                    Err(error::ErrorUnauthorized(""))
+    let app_server = {
+        let webhook_url = env::var("INTERCOM_DISCORD_WEBHOOK_URL").expect("webhook url");
+        let request_secret = env::var("INTERCOM_REQUEST_SECRET").expect("request secret");
+
+        HttpServer::new(move || {
+            let request_secret = request_secret.clone();
+            let validate_credentials = move |req: ServiceRequest, credentials: BearerAuth| {
+                let valid = credentials.token() == request_secret;
+                async move {
+                    if valid {
+                        Ok(req)
+                    } else {
+                        Err(error::ErrorUnauthorized("Invalid token."))
+                    }
                 }
-            }
-        };
+            };
 
-        App::new()
-            .wrap(HttpAuthentication::bearer(validate_credentials))
-            .data(state)
-            .service(handle_ping)
-            .service(handle_notify)
-    })
-    .bind("0.0.0.0:8080")?
-    .run()
-    .await
+            App::new()
+                .wrap(HttpAuthentication::bearer(validate_credentials))
+                .data(WebhookURLConfig {
+                    webhook_url: webhook_url.clone(),
+                })
+                .data(ping_count.clone())
+                .service(handle_ping)
+                .service(handle_notify)
+        })
+        .bind("0.0.0.0:8080")?
+        .run()
+    };
+
+    futures_util::try_join!(app_server, metrics_server)?;
+    Ok(())
 }
