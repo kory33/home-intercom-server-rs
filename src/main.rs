@@ -1,5 +1,5 @@
 use actix_web::dev::ServiceRequest;
-use actix_web::{error, post, web, App, HttpResponse, HttpServer};
+use actix_web::{error, get, post, web, App, HttpResponse, HttpServer};
 use actix_web_httpauth::extractors::bearer::BearerAuth;
 use actix_web_httpauth::middleware::HttpAuthentication;
 use actix_web_prom::PrometheusMetrics;
@@ -24,6 +24,11 @@ async fn send_webhook(webhook_url: String) -> Result<(), Box<dyn std::error::Err
                 })
         })
         .await
+}
+
+#[get("/")]
+async fn handle_index() -> HttpResponse {
+    HttpResponse::NoContent().finish()
 }
 
 #[post("/ping")]
@@ -87,6 +92,7 @@ async fn main() -> std::io::Result<()> {
                     webhook_url: webhook_url.clone(),
                 })
                 .data(ping_count.clone())
+                .service(handle_index)
                 .service(handle_ping)
                 .service(handle_notify)
         })
